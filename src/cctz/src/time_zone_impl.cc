@@ -14,42 +14,36 @@
 
 #include "time_zone_impl.h"
 
+#include <map>
 #include <mutex>
-#include <string>
-#include <unordered_map>
-#include <utility>
-
-#include "time_zone_fixed.h"
 
 namespace cctz {
 
 namespace {
 
 // time_zone::Impls are linked into a map to support fast lookup by name.
-using TimeZoneImplByName =
-    std::unordered_map<std::string, const time_zone::Impl*>;
+typedef std::map<std::string, const time_zone::Impl*> TimeZoneImplByName;
 TimeZoneImplByName* time_zone_map = nullptr;
 
 // Mutual exclusion for time_zone_map.
 std::mutex time_zone_mutex;
 
-}  // namespace
+// The utc_time_zone(). Also used for time zones that fail to load.
+const time_zone::Impl* utc_zone = nullptr;
 
-time_zone time_zone::Impl::UTC() {
-  return time_zone(UTCImpl());
+// utc_zone should only be referenced in a thread that has just done
+// a LoadUTCTimeZone().
+std::once_flag load_utc_once;
+void LoadUTCTimeZone() {
+  std::call_once(load_utc_once, []() { utc_time_zone(); });
 }
 
+}  // namespace
+
 bool time_zone::Impl::LoadTimeZone(const std::string& name, time_zone* tz) {
-  const time_zone::Impl* const utc_impl = UTCImpl();
+  const bool is_utc = (name.compare("UTC") == 0);
 
-  // First check for UTC (which is never a key in time_zone_map).
-  auto offset = sys_seconds::zero();
-  if (FixedOffsetFromName(name, &offset) && offset == sys_seconds::zero()) {
-    *tz = time_zone(utc_impl);
-    return true;
-  }
-
-  // Then check, under a shared lock, whether the time zone has already
+  // First check, under a shared lock, whether the time zone has already
   // been loaded. This is the common path. TODO: Move to shared_mutex.
   {
     std::lock_guard<std::mutex> lock(time_zone_mutex);
@@ -57,48 +51,76 @@ bool time_zone::Impl::LoadTimeZone(const std::string& name, time_zone* tz) {
       TimeZoneImplByName::const_iterator itr = time_zone_map->find(name);
       if (itr != time_zone_map->end()) {
         *tz = time_zone(itr->second);
-        return itr->second != utc_impl;
+        return is_utc || itr->second != utc_zone;
       }
     }
+  }
+
+  if (!is_utc) {
+    // Ensure that UTC is loaded before any other time zones.
+    LoadUTCTimeZone();
   }
 
   // Now check again, under an exclusive lock.
   std::lock_guard<std::mutex> lock(time_zone_mutex);
   if (time_zone_map == nullptr) time_zone_map = new TimeZoneImplByName;
-  const Impl*& impl = (*time_zone_map)[name];
+  const time_zone::Impl*& impl = (*time_zone_map)[name];
+  bool fallback_utc = false;
   if (impl == nullptr) {
     // The first thread in loads the new time zone.
-    Impl* new_impl = new Impl(name);
+    time_zone::Impl* new_impl = new time_zone::Impl(name);
     new_impl->zone_ = TimeZoneIf::Load(new_impl->name_);
     if (new_impl->zone_ == nullptr) {
-      delete new_impl;  // free the nascent Impl
-      impl = utc_impl;  // and fallback to UTC
+      delete new_impl;  // free the nascent time_zone::Impl
+      impl = utc_zone;  // and fallback to UTC
+      fallback_utc = true;
     } else {
+      if (is_utc) {
+        // Happens before any reference to utc_zone.
+        utc_zone = new_impl;
+      }
       impl = new_impl;  // install new time zone
     }
   }
   *tz = time_zone(impl);
-  return impl != utc_impl;
+  return !fallback_utc;
 }
 
 const time_zone::Impl& time_zone::Impl::get(const time_zone& tz) {
   if (tz.impl_ == nullptr) {
     // Dereferencing an implicit-UTC time_zone is expected to be
     // rare, so we don't mind paying a small synchronization cost.
-    return *UTCImpl();
+    LoadUTCTimeZone();
+    return *utc_zone;
   }
   return *tz.impl_;
 }
 
 time_zone::Impl::Impl(const std::string& name) : name_(name) {}
 
-const time_zone::Impl* time_zone::Impl::UTCImpl() {
-  static Impl* utc_impl = [] {
-    Impl* impl = new Impl("UTC");
-    impl->zone_ = TimeZoneIf::Load(impl->name_);  // never fails
-    return impl;
-  }();
-  return utc_impl;
+time_zone::absolute_lookup time_zone::Impl::BreakTime(
+    const time_point<sys_seconds>& tp) const {
+  time_zone::absolute_lookup res;
+  Breakdown bd = zone_->BreakTime(tp);
+  // TODO: Eliminate extra normalization.
+  res.cs =
+      civil_second(bd.year, bd.month, bd.day, bd.hour, bd.minute, bd.second);
+  res.offset = bd.offset;
+  res.is_dst = bd.is_dst;
+  res.abbr = bd.abbr;
+  return res;
+}
+
+time_zone::civil_lookup time_zone::Impl::MakeTimeInfo(civil_second cs) const {
+  time_zone::civil_lookup res;
+  // TODO: Eliminate extra normalization.
+  TimeInfo t = zone_->MakeTimeInfo(cs.year(), cs.month(), cs.day(),
+                                   cs.hour(), cs.minute(), cs.second());
+  res.kind = t.kind;
+  res.pre = t.pre;
+  res.trans = t.trans;
+  res.post = t.post;
+  return res;
 }
 
 }  // namespace cctz
